@@ -235,3 +235,85 @@ func TestSessionAppendData(t *testing.T) {
 		}
 	}
 }
+
+// clr encodes value as the server sends a column value: a length byte, or 0xFE and chunks of at most chunk bytes
+// with 1-byte sizes (4-byte compressed sizes when big), ending with an empty chunk.
+func clr(value []byte, chunk int, big bool) []byte {
+	if len(value) < 0xFE && chunk == 0 {
+		return append([]byte{byte(len(value))}, value...)
+	}
+	out := []byte{0xFE}
+	size := func(n int) {
+		if big {
+			var b [4]byte
+			binary.BigEndian.PutUint32(b[:], uint32(n))
+			trimmed := bytes.TrimLeft(b[:], "\x00")
+			out = append(out, byte(len(trimmed)))
+			out = append(out, trimmed...)
+		} else {
+			out = append(out, byte(n))
+		}
+	}
+	for len(value) > 0 {
+		n := minInt(chunk, len(value))
+		size(n)
+		out = append(out, value[:n]...)
+		value = value[n:]
+	}
+	size(0)
+	return out
+}
+
+func TestSessionGetClr(t *testing.T) {
+	long := pattern(70_000)
+	var stream []byte
+	stream = append(stream, 0)    // NULL
+	stream = append(stream, 0xFF) // NULL
+	stream = append(stream, clr([]byte("abc"), 0, false)...)
+	stream = append(stream, clr(long[:252], 0, false)...)
+	stream = append(stream, clr(long[:4000], 64, false)...)
+	stream = append(stream, clr(long, 32767, true)...)
+	stream = append(stream, 0xFE, 0) // chunked with no chunks: NULL
+	{
+		for _, packet := range []int{7, 100, 8192, 1 << 20} {
+			session := newStreamSession(dataPackets(stream, packet), packet)
+			session.UseBigClrChunks = false
+			want := [][]byte{nil, nil, []byte("abc"), long[:252], long[:4000]}
+			for i, w := range want {
+				got, err := session.GetClr()
+				if err != nil {
+					t.Fatalf("packet %d, value %d: %v", packet, i, err)
+				}
+				if !bytes.Equal(got, w) || (w == nil) != (got == nil) {
+					t.Fatalf("packet %d, value %d: wrong bytes", packet, i)
+				}
+				if got != nil && cap(got) != len(got) {
+					t.Fatalf("packet %d, value %d: capacity %d for %d bytes", packet, i, cap(got), len(got))
+				}
+			}
+			session.UseBigClrChunks = true
+			got, err := session.GetClr()
+			if err != nil || !bytes.Equal(got, long) {
+				t.Fatalf("packet %d, big chunks: %v", packet, err)
+			}
+			got, err = session.GetClr()
+			if err != nil || got != nil {
+				t.Fatalf("packet %d, empty chunked value: %v, %v", packet, got, err)
+			}
+		}
+	}
+	{
+		// The value is a copy: reading on doesn't change it.
+		session := newStreamSession(dataPackets(append(clr([]byte("value"), 0, false), pattern(200_000)...), 1000), 1000)
+		got, err := session.GetClr()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := session.read(200_000); err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != "value" {
+			t.Fatalf("got %q", got)
+		}
+	}
+}

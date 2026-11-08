@@ -1716,35 +1716,51 @@ func (session *Session) GetClr() (output []byte, err error) {
 	}
 	chunkSize := int(nb)
 	var chunk []byte
-	var tempBuffer bytes.Buffer
-	if chunkSize == 0xFE {
-		for chunkSize > 0 {
-			//if session.IsBreak() {
-			//	break
-			//}
-			if session.UseBigClrChunks {
-				chunkSize, err = session.GetInt(4, true, true)
-			} else {
-				nb, err = session.GetByte()
-				chunkSize = int(nb)
-			}
-			if err != nil {
-				return
-			}
-			chunk, err = session.GetBytes(chunkSize)
-			if err != nil {
-				return
-			}
-			tempBuffer.Write(chunk)
-		}
-	} else {
+	// Optimization: copy the value once, at its exact size. A bytes.Buffer allocated at least 64 bytes and then grew,
+	// copying a long value several times.
+	if chunkSize != 0xFE {
 		chunk, err = session.GetBytes(chunkSize)
 		if err != nil {
 			return
 		}
-		tempBuffer.Write(chunk)
+		output = make([]byte, chunkSize)
+		copy(output, chunk)
+		return
 	}
-	output = tempBuffer.Bytes()
+	// The chunks are slices of inBuffer, which appendData never overwrites, so they can be gathered before the copy.
+	var gathered [8][]byte
+	chunks := gathered[:0]
+	total := 0
+	for chunkSize > 0 {
+		//if session.IsBreak() {
+		//	break
+		//}
+		if session.UseBigClrChunks {
+			chunkSize, err = session.GetInt(4, true, true)
+		} else {
+			nb, err = session.GetByte()
+			chunkSize = int(nb)
+		}
+		if err != nil {
+			return
+		}
+		chunk, err = session.GetBytes(chunkSize)
+		if err != nil {
+			return
+		}
+		if len(chunk) > 0 {
+			chunks = append(chunks, chunk)
+			total += len(chunk)
+		}
+	}
+	// A value of no chunks stays nil, as callers read nil as NULL.
+	if total == 0 {
+		return
+	}
+	output = make([]byte, 0, total)
+	for _, chunk := range chunks {
+		output = append(output, chunk...)
+	}
 	return
 	// var size uint8
 	// var rb []byte
