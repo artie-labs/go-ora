@@ -48,7 +48,7 @@ type Session struct {
 	sslConn        *tls.Conn
 	reader         *bufio.Reader
 	remainingBytes int
-	lastPacket     bytes.Buffer
+	lastPacket     []byte
 	Context        *SessionContext
 	sendPcks       []PacketInterface
 	inBuffer       []byte
@@ -89,10 +89,9 @@ func NewSessionWithInputBufferForDebug(input []byte) *Session {
 	}
 	return &Session{
 		// ctx:        context.Background(),
-		conn:       nil,
-		inBuffer:   input,
-		index:      0,
-		lastPacket: bytes.Buffer{},
+		conn:     nil,
+		inBuffer: input,
+		index:    0,
 		// connOption:      *connOption,
 		Context:         NewSessionContext(options),
 		Summary:         nil,
@@ -112,7 +111,6 @@ func NewSession(config *configurations.ConnectionConfig, tracer trace.Tracer) *S
 		Summary:         nil,
 		UseBigClrChunks: false,
 		ClrChunkSize:    0x40,
-		lastPacket:      bytes.Buffer{},
 		tracer:          tracer,
 	}
 }
@@ -782,9 +780,12 @@ func (session *Session) processMarker() error {
 }
 
 func (session *Session) Peek(numBytes int) ([]byte, error) {
-	oldIndex := session.index
 	ret, err := session.read(numBytes)
-	session.index = oldIndex
+	if err == nil {
+		// read can move the unread bytes to a new block (see appendData), so step back instead of restoring the old
+		// index.
+		session.index -= numBytes
+	}
 	return ret, err
 }
 
@@ -900,12 +901,51 @@ func (session *Session) read(numBytes int) ([]byte, error) {
 	// 		}
 	// 	}
 	// }
-	ret := session.inBuffer[session.index : session.index+numBytes]
+	// The capacity stops at the returned bytes, so a caller appending to them copies instead of overwriting the
+	// bytes after them.
+	ret := session.inBuffer[session.index : session.index+numBytes : session.index+numBytes]
 	session.index += numBytes
 	if len(ret) < requiredLen {
 		return nil, errors.New("buffer under-run during read operation")
 	}
 	return ret, nil
+}
+
+// minDataBlock is the smallest block appendData allocates.
+const minDataBlock = 0x10000
+
+// appendData adds a data packet's payload to inBuffer for read to consume.
+//
+// read returns slices of inBuffer, and callers keep some of them (LOB locators, object attributes, the server's
+// capabilities), so bytes already in inBuffer are never overwritten. The payload goes into inBuffer's spare capacity,
+// or into a new block that starts with the bytes not read yet. Older blocks stay as they are for the slices that
+// point into them, and the garbage collector frees them after.
+//
+// Optimization: inBuffer used to grow by doubling to hold every packet of a response until the next request. A fetch
+// of 25,000 LogMiner rows is about 15 MB, so each fetch allocated and copied about twice that. Now inBuffer holds
+// about two packets.
+func (session *Session) appendData(data []byte) {
+	if len(data) <= cap(session.inBuffer)-len(session.inBuffer) {
+		session.inBuffer = append(session.inBuffer, data...)
+		return
+	}
+	unread := session.inBuffer[session.index:]
+	size := len(unread) + len(data)
+	capacity := 2 * size
+	if capacity < minDataBlock {
+		capacity = minDataBlock
+	}
+	block := make([]byte, size, capacity)
+	copy(block, unread)
+	copy(block[len(unread):], data)
+	// Positions move back by the bytes dropped from the front.
+	if session.breakIndex >= session.index {
+		session.breakIndex -= session.index
+	} else {
+		session.breakIndex = 0
+	}
+	session.inBuffer = block
+	session.index = 0
 }
 
 // Write a packet to the network stream
@@ -953,7 +993,16 @@ func (session *Session) readAll(size int) error {
 	// session.mu.Lock()
 	// defer session.mu.Unlock()
 	index := 0
-	tempBuffer := make([]byte, size)
+	// lastPacket holds the packet being read, its header and the part of its body read so far. Its memory is reused
+	// for the next packet, so nothing may keep a slice of it past the packet's processing.
+	// Optimization: read straight into lastPacket instead of into a new buffer per packet that was then copied into it.
+	start := len(session.lastPacket)
+	if cap(session.lastPacket)-start < size {
+		grown := make([]byte, start, start+size)
+		copy(grown, session.lastPacket)
+		session.lastPacket = grown
+	}
+	tempBuffer := session.lastPacket[start : start+size]
 	var err error
 	var temp int
 	session.remainingBytes = size
@@ -971,13 +1020,13 @@ func (session *Session) readAll(size int) error {
 				session.remainingBytes -= temp
 				index += temp
 			}
-			session.lastPacket.Write(tempBuffer[:index])
+			session.lastPacket = session.lastPacket[:start+index]
 			return err
 		}
 		session.remainingBytes -= temp
 		index += temp
 	}
-	session.lastPacket.Write(tempBuffer)
+	session.lastPacket = session.lastPacket[:start+size]
 	return nil
 }
 
@@ -985,7 +1034,7 @@ func (session *Session) readAll(size int) error {
 func (session *Session) readPacketData() error {
 	var err error
 	if session.remainingBytes > 0 {
-		if session.lastPacket.Len() < 8 { // means break occur inside head
+		if len(session.lastPacket) < 8 { // means break occur inside head
 		}
 		err = session.readAll(session.remainingBytes)
 		if err != nil {
@@ -994,7 +1043,7 @@ func (session *Session) readPacketData() error {
 		session.remainingBytes = 0
 		return nil
 	}
-	session.lastPacket.Reset()
+	session.lastPacket = session.lastPacket[:0]
 	err = session.readAll(8)
 	if err != nil {
 		// if remaining bytes = 8 means no data read so make it 0
@@ -1003,7 +1052,7 @@ func (session *Session) readPacketData() error {
 		}
 		return err
 	}
-	head := session.lastPacket.Bytes()
+	head := session.lastPacket
 	var length uint32
 	// pckType := PacketType(head[4])
 	// flag := head[5]
@@ -1018,7 +1067,7 @@ func (session *Session) readPacketData() error {
 	if err != nil {
 		return err
 	}
-	session.tracer.LogPacket("Read packet:", session.lastPacket.Bytes())
+	session.tracer.LogPacket("Read packet:", session.lastPacket)
 	return nil
 }
 
@@ -1029,7 +1078,7 @@ func (session *Session) readPacket() (PacketInterface, error) {
 	if err != nil {
 		return nil, err
 	}
-	packetData := session.lastPacket.Bytes()
+	packetData := session.lastPacket
 	pckType := PacketType(packetData[4])
 	flag := packetData[5]
 	// session.isFinalPacketRead = flag&0x20 > 0
@@ -1093,7 +1142,7 @@ func (session *Session) readPacket() (PacketInterface, error) {
 		var data string
 		if uint16(pck.length) <= pck.dataOffset {
 			err = session.readPacketData()
-			packetData = session.lastPacket.Bytes()
+			packetData = session.lastPacket
 			dataPck, err := newDataPacketFromData(packetData, session.Context, session.tracer, &session.mu)
 			if err != nil {
 				return nil, err
@@ -1123,7 +1172,7 @@ func (session *Session) readPacket() (PacketInterface, error) {
 				session.Disconnect()
 				err = driver.ErrBadConn
 			}
-			session.inBuffer = append(session.inBuffer, dataPck.buffer...)
+			session.appendData(dataPck.buffer)
 		}
 		return nil, err
 	case MARKER:
@@ -1638,7 +1687,6 @@ func (session *Session) GetInt(size int, compress bool, bigEndian bool) (int, er
 
 // GetNullTermString read a null terminated string from input buffer
 func (session *Session) GetNullTermString(maxSize int) (result string, err error) {
-	oldIndex := session.index
 	temp, err := session.read(maxSize)
 	if err != nil {
 		return
@@ -1646,7 +1694,8 @@ func (session *Session) GetNullTermString(maxSize int) (result string, err error
 	find := bytes.Index(temp, []byte{0})
 	if find > 0 {
 		result = string(temp[:find])
-		session.index = oldIndex + find + 1
+		// Relative to the end of temp: read can move the unread bytes to a new block (see appendData).
+		session.index += find + 1 - len(temp)
 	} else {
 		result = string(temp)
 	}
