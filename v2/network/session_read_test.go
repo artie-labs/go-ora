@@ -14,11 +14,13 @@ import (
 	"github.com/sijms/go-ora/v2/trace"
 )
 
-// streamConn serves a fixed byte stream to reads, in pieces of at most step bytes, as a socket does.
+// streamConn serves a fixed byte stream to reads, in pieces of at most step bytes, as a socket does, and discards
+// writes.
 type streamConn struct {
 	net.Conn
-	data []byte
-	step int
+	data   []byte
+	step   int
+	writes int
 }
 
 func (c *streamConn) Read(b []byte) (int, error) {
@@ -31,7 +33,14 @@ func (c *streamConn) Read(b []byte) (int, error) {
 	return n, nil
 }
 
-func (c *streamConn) SetReadDeadline(time.Time) error { return nil }
+func (c *streamConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *streamConn) SetWriteDeadline(time.Time) error { return nil }
+
+// Write discards b, as a marker reset sends it.
+func (c *streamConn) Write(b []byte) (int, error) {
+	c.writes++
+	return len(b), nil
+}
 
 // dataPackets splits payload into TNS data packets of at most size payload bytes each, framed as after the
 // handshake: a 4-byte length, the type, a flag, a 2-byte checksum and 2 bytes of data flags.
