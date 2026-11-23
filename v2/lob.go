@@ -43,6 +43,9 @@ type Lob struct {
 	bNullO2U      bool
 	isNull        bool
 	sendSize      bool
+	// into, while reading is set, is the caller's buffer that a read appends the LOB's data to, instead of data.
+	into    []byte
+	reading bool
 }
 
 func newLob(connection *Connection) *Lob {
@@ -481,6 +484,11 @@ func (lob *Lob) read() error {
 // read lob data chunks from network session
 func (lob *Lob) readData() error {
 	session := lob.connection.session
+	if lob.reading {
+		var err error
+		lob.into, err = session.AppendClr(lob.into)
+		return err
+	}
 	tempBytes, err := session.GetClr()
 	if err != nil {
 		return err

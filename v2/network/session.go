@@ -55,6 +55,12 @@ type Session struct {
 	outBuffer      bytes.Buffer
 	index          int
 	breakIndex     int
+	// direct, while directNeed is positive, is where appendBytes wants the next directNeed bytes of data packets to
+	// go instead of inBuffer.
+	direct     *[]byte
+	directNeed int
+	// directRead is the buffer readAll reads packets appendBytes is waiting for into.
+	directRead []byte
 	// doneContext       []chan struct{}
 	TimeZone          []byte
 	TTCVersion        uint8
@@ -953,7 +959,16 @@ func (session *Session) readAll(size int) error {
 	// session.mu.Lock()
 	// defer session.mu.Unlock()
 	index := 0
-	tempBuffer := make([]byte, size)
+	var tempBuffer []byte
+	if session.directNeed > 0 && cap(session.directRead) >= size {
+		// A packet appendBytes is waiting for: lastPacket copies tempBuffer, so reuse it.
+		tempBuffer = session.directRead[:size]
+	} else {
+		tempBuffer = make([]byte, size)
+		if session.directNeed > 0 {
+			session.directRead = tempBuffer
+		}
+	}
 	var err error
 	var temp int
 	session.remainingBytes = size
@@ -1123,7 +1138,7 @@ func (session *Session) readPacket() (PacketInterface, error) {
 				session.Disconnect()
 				err = driver.ErrBadConn
 			}
-			session.inBuffer = append(session.inBuffer, dataPck.buffer...)
+			session.takeData(dataPck.buffer)
 		}
 		return nil, err
 	case MARKER:
@@ -1732,6 +1747,71 @@ func (session *Session) GetClr() (output []byte, err error) {
 	// }
 	// output = tempBuffer.Bytes()
 	// return
+}
+
+// takeData appends a data packet's payload to inBuffer, after copying what appendBytes is waiting for to its buffer.
+func (session *Session) takeData(data []byte) {
+	if n := session.directNeed; n > 0 {
+		if n > len(data) {
+			n = len(data)
+		}
+		*session.direct = append(*session.direct, data[:n]...)
+		session.directNeed -= n
+		data = data[n:]
+	}
+	session.inBuffer = append(session.inBuffer, data...)
+}
+
+// AppendClr reads a value as GetClr does and appends it to dst, returning the extended slice, or dst for a NULL. The
+// bytes the input buffer doesn't hold yet go from each data packet straight into dst, so a long value, such as a
+// LOB's data, isn't first appended to the input buffer and then copied out of it.
+func (session *Session) AppendClr(dst []byte) ([]byte, error) {
+	nb, err := session.GetByte()
+	if err != nil || nb == 0 || nb == 0xFF || nb == 0xFD {
+		return dst, err
+	}
+	if nb != 0xFE {
+		dst, _, err = session.appendBytes(dst, int(nb), nil)
+		return dst, err
+	}
+	// rest is the input buffer the last chunk's read started, which only chunk lengths have been read from since, so
+	// the next chunk's read can start it again.
+	var rest []byte
+	for {
+		var size int
+		if session.UseBigClrChunks {
+			size, err = session.GetInt(4, true, true)
+		} else {
+			nb, err = session.GetByte()
+			size = int(nb)
+		}
+		if err != nil || size <= 0 {
+			return dst, err
+		}
+		if dst, rest, err = session.appendBytes(dst, size, rest); err != nil {
+			return dst, err
+		}
+	}
+}
+
+// appendBytes appends the response's next n bytes to dst. Bytes after them that it reads go to a new input buffer, in
+// rest's memory if rest is non-nil, and it returns that buffer.
+func (session *Session) appendBytes(dst []byte, n int, rest []byte) ([]byte, []byte, error) {
+	buffered := session.inBuffer[session.index:]
+	if len(buffered) >= n {
+		session.index += n
+		return append(dst, buffered[:n]...), rest, nil
+	}
+	dst = append(dst, buffered...)
+	// Start a new input buffer for the bytes after these, rather than growing this one by every packet's leftover
+	// bytes. Slices of the old one stay as they are.
+	session.inBuffer, session.index, session.breakIndex = rest[:0], 0, 0
+	session.direct, session.directNeed = &dst, n-len(buffered)
+	defer func() { session.direct, session.directNeed = nil, 0 }()
+	// read reads packets until the input buffer holds a byte past these n, which a LOB read's response always has, and
+	// takeData appends the n bytes to dst on the way.
+	_, err := session.Peek(1)
+	return dst, session.inBuffer, err
 }
 
 // GetDlc read variable length bytearray from input buffer
