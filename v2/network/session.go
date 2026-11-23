@@ -59,6 +59,8 @@ type Session struct {
 	// go instead of inBuffer.
 	direct     *[]byte
 	directNeed int
+	// directRead is the buffer readAll reads packets appendBytes is waiting for into.
+	directRead []byte
 	// doneContext       []chan struct{}
 	TimeZone          []byte
 	TTCVersion        uint8
@@ -957,7 +959,16 @@ func (session *Session) readAll(size int) error {
 	// session.mu.Lock()
 	// defer session.mu.Unlock()
 	index := 0
-	tempBuffer := make([]byte, size)
+	var tempBuffer []byte
+	if session.directNeed > 0 && cap(session.directRead) >= size {
+		// A packet appendBytes is waiting for: lastPacket copies tempBuffer, so reuse it.
+		tempBuffer = session.directRead[:size]
+	} else {
+		tempBuffer = make([]byte, size)
+		if session.directNeed > 0 {
+			session.directRead = tempBuffer
+		}
+	}
 	var err error
 	var temp int
 	session.remainingBytes = size
@@ -1760,8 +1771,12 @@ func (session *Session) AppendClr(dst []byte) ([]byte, error) {
 		return dst, err
 	}
 	if nb != 0xFE {
-		return session.appendBytes(dst, int(nb))
+		dst, _, err = session.appendBytes(dst, int(nb), nil)
+		return dst, err
 	}
+	// rest is the input buffer the last chunk's read started, which only chunk lengths have been read from since, so
+	// the next chunk's read can start it again.
+	var rest []byte
 	for {
 		var size int
 		if session.UseBigClrChunks {
@@ -1773,29 +1788,30 @@ func (session *Session) AppendClr(dst []byte) ([]byte, error) {
 		if err != nil || size <= 0 {
 			return dst, err
 		}
-		if dst, err = session.appendBytes(dst, size); err != nil {
+		if dst, rest, err = session.appendBytes(dst, size, rest); err != nil {
 			return dst, err
 		}
 	}
 }
 
-// appendBytes appends the response's next n bytes to dst.
-func (session *Session) appendBytes(dst []byte, n int) ([]byte, error) {
+// appendBytes appends the response's next n bytes to dst. Bytes after them that it reads go to a new input buffer, in
+// rest's memory if rest is non-nil, and it returns that buffer.
+func (session *Session) appendBytes(dst []byte, n int, rest []byte) ([]byte, []byte, error) {
 	buffered := session.inBuffer[session.index:]
 	if len(buffered) >= n {
 		session.index += n
-		return append(dst, buffered[:n]...), nil
+		return append(dst, buffered[:n]...), rest, nil
 	}
 	dst = append(dst, buffered...)
-	// Start a new input buffer for the bytes after the value, rather than growing this one by every packet's leftover
+	// Start a new input buffer for the bytes after these, rather than growing this one by every packet's leftover
 	// bytes. Slices of the old one stay as they are.
-	session.inBuffer, session.index, session.breakIndex = nil, 0, 0
+	session.inBuffer, session.index, session.breakIndex = rest[:0], 0, 0
 	session.direct, session.directNeed = &dst, n-len(buffered)
 	defer func() { session.direct, session.directNeed = nil, 0 }()
 	// read reads packets until the input buffer holds a byte past these n, which a LOB read's response always has, and
 	// takeData appends the n bytes to dst on the way.
 	_, err := session.Peek(1)
-	return dst, err
+	return dst, session.inBuffer, err
 }
 
 // GetDlc read variable length bytearray from input buffer

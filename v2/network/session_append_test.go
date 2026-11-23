@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 
@@ -163,6 +164,52 @@ func TestAppendClr(t *testing.T) {
 					}
 				}
 			}
+		}
+	}
+	{
+		// A slice read after one value keeps its bytes through the next value's read.
+		first, second := pattern(100_000), pattern(70_000)
+		var stream []byte
+		stream = append(stream, clr(first, 32<<10, true)...)
+		stream = append(stream, "locator"...)
+		stream = append(stream, clr(second, 8191, true)...)
+		stream = append(stream, "end"...)
+		session, _ := newStreamSession(dataPackets(stream, 8<<10), 1<<20)
+		session.UseBigClrChunks = true
+		got, err := session.AppendClr(nil)
+		if err != nil || !bytes.Equal(got, first) {
+			t.Fatalf("first value: %v", err)
+		}
+		locator, err := session.GetBytes(len("locator"))
+		if err != nil || string(locator) != "locator" {
+			t.Fatalf("read %q, %v after the first value", locator, err)
+		}
+		if got, err = session.AppendClr(got[:0]); err != nil || !bytes.Equal(got, second) {
+			t.Fatalf("second value: %v", err)
+		}
+		if string(locator) != "locator" {
+			t.Fatalf("the slice read between the values changed to %q", locator)
+		}
+		if end, err := session.GetBytes(3); err != nil || string(end) != "end" {
+			t.Fatalf("read %q, %v after the second value", end, err)
+		}
+	}
+	{
+		// Reading a long value into a buffer that holds it allocates little: the packet and leftover buffers are reused
+		// from chunk to chunk, leaving the first buffers and each packet's header.
+		value := pattern(4 << 20)
+		session, _ := newStreamSession(dataPackets(append(clr(value, 32<<10, true), 0), 8<<10), 1<<20)
+		session.UseBigClrChunks = true
+		dst := make([]byte, 0, len(value))
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		got, err := session.AppendClr(dst)
+		runtime.ReadMemStats(&after)
+		if err != nil || !bytes.Equal(got, value) {
+			t.Fatalf("read: %v", err)
+		}
+		if allocated := after.TotalAlloc - before.TotalAlloc; allocated > uint64(len(value)/32) {
+			t.Fatalf("allocated %d bytes reading a %d-byte value", allocated, len(value))
 		}
 	}
 	{
