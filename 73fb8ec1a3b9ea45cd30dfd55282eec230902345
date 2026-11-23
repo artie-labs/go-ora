@@ -1,0 +1,1 @@
+Self-review of the isZero fix: one-line change; Oracle stores zero as exactly the one byte 0x80, so near-zero values (exponent byte 0x80 plus mantissa) are no longer zero in decode and the bool conversion. Test fails before, passes after. Pre-existing and unrelated: urowid_test.go doesn't build at v2.9.0 and TestEncodeValue panics; ran with urowid_test.go aside. gofmt clean.
