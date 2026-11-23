@@ -1,0 +1,1 @@
+Follow-up to Hermes COMMENTED on 842d040d: first block sized from its packet (test); LOB append branch tested over two parts (disabling it fails the test). Not changed: replay over framed packets (helpers live in package network; replied), partial state after a failed column decode (only after a recovered fetch error; replied).
