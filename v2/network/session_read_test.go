@@ -234,6 +234,14 @@ func TestSessionAppendData(t *testing.T) {
 			t.Fatalf("new block capacity %d", cap(session.inBuffer))
 		}
 	}
+	{
+		// A response's first packet, after ResetBuffer, gets a block of its own size.
+		session := &Session{}
+		session.appendData([]byte{1, 2, 3})
+		if !bytes.Equal(session.inBuffer, []byte{1, 2, 3}) || cap(session.inBuffer) != 3 {
+			t.Fatalf("first block %v, capacity %d", session.inBuffer, cap(session.inBuffer))
+		}
+	}
 }
 
 // clr encodes value as the server sends a column value: a length byte, or 0xFE and chunks of at most chunk bytes

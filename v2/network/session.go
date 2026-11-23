@@ -931,9 +931,14 @@ func (session *Session) appendData(data []byte) {
 	}
 	unread := session.inBuffer[session.index:]
 	size := len(unread) + len(data)
-	capacity := 2 * size
-	if capacity < minDataBlock {
-		capacity = minDataBlock
+	// A response's first block, after ResetBuffer, holds only its first packet, so a small response such as a commit's
+	// allocates about its own size. Later blocks leave room for the packets that follow.
+	capacity := size
+	if cap(session.inBuffer) > 0 {
+		capacity = 2 * size
+		if capacity < minDataBlock {
+			capacity = minDataBlock
+		}
 	}
 	block := make([]byte, size, capacity)
 	copy(block, unread)
