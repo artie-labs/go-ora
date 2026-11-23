@@ -40,12 +40,12 @@ type Lob struct {
 	charsetID     int
 	size          int64
 	data          bytes.Buffer
-	// into, when reading is set, is the caller's buffer that a read appends the LOB's data to, instead of data.
-	into     []byte
-	reading  bool
-	bNullO2U bool
-	isNull   bool
-	sendSize bool
+	bNullO2U      bool
+	isNull        bool
+	sendSize      bool
+	// into, while reading is set, is the caller's buffer that a read appends the LOB's data to, instead of data.
+	into    []byte
+	reading bool
 }
 
 func newLob(connection *Connection) *Lob {
@@ -93,17 +93,6 @@ func (lob *Lob) getSize() (size int64, err error) {
 	size = lob.size
 	lob.connection.tracer.Print("Lob Size: ", size)
 	return
-}
-
-// appendDataWithOffsetSize reads the data getDataWithOffsetSize returns and appends it to dst. The data goes straight
-// into dst, without the copies into the LOB's own buffer, so a caller reading a file in pieces can reuse one buffer.
-func (lob *Lob) appendDataWithOffsetSize(ctx context.Context, offset, count int64, dst []byte) ([]byte, error) {
-	lob.into, lob.reading = dst, true
-	defer func() { lob.into, lob.reading = nil, false }()
-	if _, err := lob.getDataWithOffsetSize(ctx, offset, count); err != nil {
-		return dst, err
-	}
-	return lob.into, nil
 }
 
 func (lob *Lob) getDataWithOffsetSize(ctx context.Context, offset, count int64) (data []byte, err error) {
