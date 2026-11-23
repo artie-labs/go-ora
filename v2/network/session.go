@@ -1704,37 +1704,54 @@ func (session *Session) GetNullTermString(maxSize int) (result string, err error
 
 // GetClr reed variable length bytearray from input buffer
 func (session *Session) GetClr() (output []byte, err error) {
-	var nb byte
-	nb, err = session.GetByte()
-	if err != nil {
-		return
+	var gathered [8][]byte
+	chunks, total, err := session.clrChunks(gathered[:0])
+	if err != nil || chunks == nil {
+		return nil, err
 	}
-	if nb == 0 || nb == 0xFF || nb == 0xFD {
-		output = nil
-		err = nil
-		return
-	}
-	chunkSize := int(nb)
-	var chunk []byte
 	// Optimization: copy the value once, at its exact size. A bytes.Buffer allocated at least 64 bytes and then grew,
 	// copying a long value several times.
-	if chunkSize != 0xFE {
-		chunk, err = session.GetBytes(chunkSize)
-		if err != nil {
-			return
-		}
-		output = make([]byte, chunkSize)
-		copy(output, chunk)
-		return
+	output = make([]byte, 0, total)
+	for _, chunk := range chunks {
+		output = append(output, chunk...)
 	}
-	// The chunks are slices of inBuffer, which appendData never overwrites, so they can be gathered before the copy.
+	return output, nil
+}
+
+// AppendClr reads a value as GetClr does and appends it to dst, so a caller reading many values, such as a LOB's
+// chunks into one buffer, can reuse its memory. It returns dst unchanged for a NULL.
+func (session *Session) AppendClr(dst []byte) ([]byte, error) {
 	var gathered [8][]byte
-	chunks := gathered[:0]
-	total := 0
+	chunks, _, err := session.clrChunks(gathered[:0])
+	if err != nil {
+		return dst, err
+	}
+	for _, chunk := range chunks {
+		dst = append(dst, chunk...)
+	}
+	return dst, nil
+}
+
+// clrChunks reads a value's chunks into chunks and returns them with their total length. It returns nil chunks for a
+// NULL, including a chunked value with no chunks. The chunks are slices of inBuffer, which appendData never
+// overwrites, so they stay valid until the caller copies them.
+func (session *Session) clrChunks(chunks [][]byte) (_ [][]byte, total int, err error) {
+	nb, err := session.GetByte()
+	if err != nil {
+		return nil, 0, err
+	}
+	if nb == 0 || nb == 0xFF || nb == 0xFD {
+		return nil, 0, nil
+	}
+	chunkSize := int(nb)
+	if chunkSize != 0xFE {
+		chunk, err := session.GetBytes(chunkSize)
+		if err != nil {
+			return nil, 0, err
+		}
+		return append(chunks, chunk), chunkSize, nil
+	}
 	for chunkSize > 0 {
-		//if session.IsBreak() {
-		//	break
-		//}
 		if session.UseBigClrChunks {
 			chunkSize, err = session.GetInt(4, true, true)
 		} else {
@@ -1742,61 +1759,21 @@ func (session *Session) GetClr() (output []byte, err error) {
 			chunkSize = int(nb)
 		}
 		if err != nil {
-			return
+			return nil, 0, err
 		}
-		chunk, err = session.GetBytes(chunkSize)
+		chunk, err := session.GetBytes(chunkSize)
 		if err != nil {
-			return
+			return nil, 0, err
 		}
 		if len(chunk) > 0 {
 			chunks = append(chunks, chunk)
 			total += len(chunk)
 		}
 	}
-	// A value of no chunks stays nil, as callers read nil as NULL.
 	if total == 0 {
-		return
+		return nil, 0, nil
 	}
-	output = make([]byte, 0, total)
-	for _, chunk := range chunks {
-		output = append(output, chunk...)
-	}
-	return
-	// var size uint8
-	// var rb []byte
-	// size, err = session.GetByte()
-	// if err != nil {
-	// 	return
-	// }
-	// if size == 0 || size == 0xFF {
-	// 	output = nil
-	// 	err = nil
-	// 	return
-	// }
-	// if size != 0xFE {
-	// 	output, err = session.read(int(size))
-	// 	return
-	// }
-	//
-	// for {
-	// 	var size1 int
-	// 	if session.UseBigClrChunks {
-	// 		size1, err = session.GetInt(4, true, true)
-	// 	} else {
-	// 		size, err = session.GetByte()
-	// 		size1 = int(size)
-	// 	}
-	// 	if err != nil || size1 == 0 {
-	// 		break
-	// 	}
-	// 	rb, err = session.read(size1)
-	// 	if err != nil {
-	// 		return
-	// 	}
-	// 	tempBuffer.Write(rb)
-	// }
-	// output = tempBuffer.Bytes()
-	// return
+	return chunks, total, nil
 }
 
 // GetDlc read variable length bytearray from input buffer

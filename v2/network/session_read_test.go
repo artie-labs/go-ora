@@ -317,3 +317,82 @@ func TestSessionGetClr(t *testing.T) {
 		}
 	}
 }
+
+func TestSessionAppendClr(t *testing.T) {
+	long := pattern(70_000)
+	var stream []byte
+	stream = append(stream, 0) // NULL
+	stream = append(stream, clr([]byte("abc"), 0, false)...)
+	stream = append(stream, clr(long[:4000], 64, false)...)
+	stream = append(stream, 0xFE, 0) // chunked with no chunks: NULL
+	stream = append(stream, clr(long, 32767, true)...)
+	for _, packet := range []int{7, 100, 8192, 1 << 20} {
+		// Every value is appended after what dst holds, across packets and blocks, and a NULL appends nothing.
+		session := newStreamSession(dataPackets(stream, packet), packet)
+		dst := []byte("prefix")
+		var err error
+		want := append([]byte("prefix"), "abc"...)
+		want = append(want, long[:4000]...)
+		for i := 0; i < 4; i++ {
+			if dst, err = session.AppendClr(dst); err != nil {
+				t.Fatalf("packet %d, value %d: %v", packet, i, err)
+			}
+		}
+		if !bytes.Equal(dst, want) {
+			t.Fatalf("packet %d: wrong bytes", packet)
+		}
+		session.UseBigClrChunks = true
+		if dst, err = session.AppendClr(dst[:0]); err != nil || !bytes.Equal(dst, long) {
+			t.Fatalf("packet %d, big chunks: %v", packet, err)
+		}
+	}
+	{
+		// A buffer large enough takes the value without allocating.
+		input := clr(long, 32767, true)
+		dst := make([]byte, 0, len(long))
+		allocs := testing.AllocsPerRun(10, func() {
+			session := NewSessionWithInputBufferForDebug(input)
+			session.UseBigClrChunks = true
+			var err error
+			if dst, err = session.AppendClr(dst[:0]); err != nil || len(dst) != len(long) {
+				t.Fatal(err)
+			}
+		})
+		var session *Session
+		baseline := testing.AllocsPerRun(10, func() { session = NewSessionWithInputBufferForDebug(input) })
+		_ = session
+		if allocs != baseline {
+			t.Fatalf("AppendClr allocated %v times beyond creating its session", allocs-baseline)
+		}
+	}
+}
+
+// BenchmarkSessionReadLOB reads a 1 MiB value in 32 KiB chunks from 8 KiB packets, as a BFILE read returns it.
+func BenchmarkSessionReadLOB(b *testing.B) {
+	value := pattern(1 << 20)
+	stream := dataPackets(clr(value, 32767, true), 8192)
+	b.Run("GetClr", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(value)))
+		for i := 0; i < b.N; i++ {
+			session := newStreamSession(stream, len(stream))
+			session.UseBigClrChunks = true
+			if got, err := session.GetClr(); err != nil || len(got) != len(value) {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("AppendClr", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(value)))
+		dst := make([]byte, 0, len(value))
+		for i := 0; i < b.N; i++ {
+			session := newStreamSession(stream, len(stream))
+			session.UseBigClrChunks = true
+			var err error
+			if dst, err = session.AppendClr(dst[:0]); err != nil || len(dst) != len(value) {
+				b.Fatal(err)
+			}
+		}
+	})
+}
