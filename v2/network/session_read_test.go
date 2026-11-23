@@ -487,3 +487,25 @@ func TestSessionAppendClrReusesBlocks(t *testing.T) {
 		}
 	}
 }
+
+func TestSessionStatesCountAsLending(t *testing.T) {
+	// A saved state keeps inBuffer, so after SaveState or LoadState its memory isn't reused.
+	session := &Session{inBuffer: make([]byte, 0, 64)}
+	session.SaveState(nil)
+	if !session.lent {
+		t.Fatal("SaveState didn't count as lending")
+	}
+	session.lent = false
+	session.LoadState()
+	if !session.lent {
+		t.Fatal("LoadState didn't count as lending")
+	}
+}
+
+func TestSessionGetStringLongerThanValue(t *testing.T) {
+	session := NewSessionWithInputBufferForDebug(clr([]byte("abc"), 0, false))
+	got, err := session.GetString(10)
+	if err != nil || got != "abc" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+}

@@ -940,9 +940,10 @@ const minDataBlock = 0x10000
 // appendData adds a data packet's payload to inBuffer for read to consume.
 //
 // read returns slices of inBuffer, and callers keep some of them (LOB locators, object attributes, the server's
-// capabilities), so bytes already in inBuffer are never overwritten. The payload goes into inBuffer's spare capacity,
-// or into a new block that starts with the bytes not read yet. Older blocks stay as they are for the slices that
-// point into them, and the garbage collector frees them after.
+// capabilities), so once read has lent a slice of a block, its bytes are never overwritten. The payload goes into
+// inBuffer's spare capacity, or into a new block that starts with the bytes not read yet. Older blocks stay as they
+// are for the slices that point into them, and the garbage collector frees them after. Only while nothing has been
+// lent, as readNoLend allows, do the unread bytes move to the front of the same block.
 //
 // Optimization: inBuffer used to grow by doubling to hold every packet of a response until the next request. A fetch
 // of 25,000 LogMiner rows is about 15 MB, so each fetch allocated and copied about twice that. Now inBuffer holds
@@ -1456,6 +1457,10 @@ func (session *Session) PutString(data string) {
 // GetString read a string data from input buffer
 func (session *Session) GetString(length int) (string, error) {
 	ret, err := session.GetClr()
+	// GetClr's result is exactly the value's size, so a longer length takes the whole value.
+	if length > len(ret) {
+		length = len(ret)
+	}
 	return string(ret[:length]), err
 }
 
@@ -1802,8 +1807,9 @@ func (session *Session) appendBytes(dst []byte, n int) ([]byte, error) {
 }
 
 // clrChunks reads a value's chunks into chunks and returns them with their total length. It returns nil chunks for a
-// NULL, including a chunked value with no chunks. The chunks are slices of inBuffer, which appendData never
-// overwrites, so they stay valid until the caller copies them.
+// NULL, including a chunked value with no chunks. The chunks are slices of inBuffer read with GetBytes, which lends
+// them, so appendData doesn't overwrite them and they stay valid until the caller copies them. Reading them with
+// readNoLend instead would let a later packet overwrite the earlier chunks.
 func (session *Session) clrChunks(chunks [][]byte) (_ [][]byte, total int, err error) {
 	nb, err := session.GetByte()
 	if err != nil {
