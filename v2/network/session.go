@@ -52,9 +52,12 @@ type Session struct {
 	Context        *SessionContext
 	sendPcks       []PacketInterface
 	inBuffer       []byte
-	outBuffer      bytes.Buffer
-	index          int
-	breakIndex     int
+	// lent reports whether a slice of inBuffer has been handed out, which a caller may keep. Until then, appendData and
+	// resetRead may reuse inBuffer's memory instead of allocating a new block.
+	lent       bool
+	outBuffer  bytes.Buffer
+	index      int
+	breakIndex int
 	// doneContext       []chan struct{}
 	TimeZone          []byte
 	TTCVersion        uint8
@@ -120,6 +123,8 @@ func NewSession(config *configurations.ConnectionConfig, tracer trace.Tracer) *S
 func (session *Session) SaveState(newState *SessionState) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
+	// The saved state keeps inBuffer, so its memory must not be reused.
+	session.lent = true
 	session.states = append(session.states, SessionState{
 		summary:   session.Summary,
 		sendPcks:  session.sendPcks,
@@ -156,6 +161,7 @@ func (session *Session) LoadState() (oldState *SessionState) {
 		session.inBuffer = currentState.InBuffer
 		session.outBuffer = currentState.OutBuffer
 		session.index = currentState.index
+		session.lent = true
 		if index == 0 {
 			session.states = nil
 		} else {
@@ -173,7 +179,13 @@ func (session *Session) resetWrite() {
 }
 
 func (session *Session) resetRead() {
-	session.inBuffer = nil
+	// Optimization: a block nothing holds a slice of is reused for the next response.
+	if session.lent {
+		session.inBuffer = nil
+	} else {
+		session.inBuffer = session.inBuffer[:0]
+	}
+	session.lent = false
 	session.index = 0
 }
 
@@ -791,7 +803,18 @@ func (session *Session) Peek(numBytes int) ([]byte, error) {
 
 // Read numBytes of data from input buffer if requested data is larger
 // than input buffer session will get the remaining from network stream
+// read returns the next numBytes bytes, a slice of inBuffer the caller may keep, so their memory is never reused.
 func (session *Session) read(numBytes int) ([]byte, error) {
+	ret, err := session.readNoLend(numBytes)
+	if err == nil {
+		session.lent = true
+	}
+	return ret, err
+}
+
+// readNoLend is read for a caller that's done with the bytes before its next read, such as one decoding a number or
+// copying them, so inBuffer's memory may be reused after.
+func (session *Session) readNoLend(numBytes int) ([]byte, error) {
 	var err error
 	var pck PacketInterface
 
@@ -931,6 +954,15 @@ func (session *Session) appendData(data []byte) {
 	}
 	unread := session.inBuffer[session.index:]
 	size := len(unread) + len(data)
+	// Optimization: when nothing holds a slice of inBuffer, the unread bytes move to its front instead of to a new
+	// block, so reading a long response, such as a LOB's, allocates nothing once inBuffer is large enough.
+	if !session.lent && size <= cap(session.inBuffer) {
+		n := copy(session.inBuffer[:cap(session.inBuffer)], unread)
+		session.inBuffer = append(session.inBuffer[:n], data...)
+		session.moveBreakIndex()
+		session.index = 0
+		return
+	}
 	// A response's first block, after ResetBuffer, holds only its first packet, so a small response such as a commit's
 	// allocates about its own size. Later blocks leave room for the packets that follow.
 	capacity := size
@@ -943,14 +975,19 @@ func (session *Session) appendData(data []byte) {
 	block := make([]byte, size, capacity)
 	copy(block, unread)
 	copy(block[len(unread):], data)
-	// Positions move back by the bytes dropped from the front.
+	session.moveBreakIndex()
+	session.inBuffer = block
+	session.lent = false
+	session.index = 0
+}
+
+// moveBreakIndex moves breakIndex back by the bytes before index, which appendData drops from the front.
+func (session *Session) moveBreakIndex() {
 	if session.breakIndex >= session.index {
 		session.breakIndex -= session.index
 	} else {
 		session.breakIndex = 0
 	}
-	session.inBuffer = block
-	session.index = 0
 }
 
 // Write a packet to the network stream
@@ -1630,7 +1667,7 @@ func (session *Session) PutKeyVal(key []byte, val []byte, num uint8) {
 
 // GetByte read one uint8 from input buffer
 func (session *Session) GetByte() (uint8, error) {
-	rb, err := session.read(1)
+	rb, err := session.readNoLend(1)
 	if err != nil {
 		return 0, err
 	}
@@ -1644,7 +1681,7 @@ func (session *Session) GetInt64(size int, compress bool, bigEndian bool) (int64
 	var ret int64
 	negFlag := false
 	if compress {
-		rb, err := session.read(1)
+		rb, err := session.readNoLend(1)
 		if err != nil {
 			return 0, err
 		}
@@ -1661,7 +1698,7 @@ func (session *Session) GetInt64(size int, compress bool, bigEndian bool) (int64
 		// When compress is true, "size" may be a value greater than 8 in some cases
 		return 0, errors.New("invalid size for GetInt64: " + strconv.Itoa(size))
 	}
-	rb, err := session.read(size)
+	rb, err := session.readNoLend(size)
 	if err != nil {
 		return 0, err
 	}
@@ -1692,7 +1729,7 @@ func (session *Session) GetInt(size int, compress bool, bigEndian bool) (int, er
 
 // GetNullTermString read a null terminated string from input buffer
 func (session *Session) GetNullTermString(maxSize int) (result string, err error) {
-	temp, err := session.read(maxSize)
+	temp, err := session.readNoLend(maxSize)
 	if err != nil {
 		return
 	}
@@ -1724,17 +1761,44 @@ func (session *Session) GetClr() (output []byte, err error) {
 }
 
 // AppendClr reads a value as GetClr does and appends it to dst, so a caller reading many values, such as a LOB's
-// chunks into one buffer, can reuse its memory. It returns dst unchanged for a NULL.
+// chunks into one buffer, can reuse its memory. It returns dst unchanged for a NULL. It copies each chunk before reading
+// the next, so it holds no slice of inBuffer, whose memory a long value's later packets can then reuse.
 func (session *Session) AppendClr(dst []byte) ([]byte, error) {
-	var gathered [8][]byte
-	chunks, _, err := session.clrChunks(gathered[:0])
+	nb, err := session.GetByte()
 	if err != nil {
 		return dst, err
 	}
-	for _, chunk := range chunks {
-		dst = append(dst, chunk...)
+	if nb == 0 || nb == 0xFF || nb == 0xFD {
+		return dst, nil
+	}
+	chunkSize := int(nb)
+	if chunkSize != 0xFE {
+		return session.appendBytes(dst, chunkSize)
+	}
+	for chunkSize > 0 {
+		if session.UseBigClrChunks {
+			chunkSize, err = session.GetInt(4, true, true)
+		} else {
+			nb, err = session.GetByte()
+			chunkSize = int(nb)
+		}
+		if err != nil {
+			return dst, err
+		}
+		if dst, err = session.appendBytes(dst, chunkSize); err != nil {
+			return dst, err
+		}
 	}
 	return dst, nil
+}
+
+// appendBytes appends the next n bytes to dst without lending inBuffer.
+func (session *Session) appendBytes(dst []byte, n int) ([]byte, error) {
+	chunk, err := session.readNoLend(n)
+	if err != nil {
+		return dst, err
+	}
+	return append(dst, chunk...), nil
 }
 
 // clrChunks reads a value's chunks into chunks and returns them with their total length. It returns nil chunks for a

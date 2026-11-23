@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 
@@ -220,9 +221,10 @@ func TestSessionAppendData(t *testing.T) {
 		}
 	}
 	{
-		// A new block starts at the first unread byte, the old block is untouched, and breakIndex moves with it.
+		// After a slice was lent, a new block starts at the first unread byte, the old block is untouched, and breakIndex
+		// moves with it.
 		old := []byte{1, 2, 3, 4, 5, 6}
-		session := &Session{inBuffer: old[:6:6], index: 4, breakIndex: 6}
+		session := &Session{inBuffer: old[:6:6], index: 4, breakIndex: 6, lent: true}
 		session.appendData([]byte{7, 8})
 		if !bytes.Equal(session.inBuffer, []byte{5, 6, 7, 8}) || session.index != 0 || session.breakIndex != 2 {
 			t.Fatalf("got %v index %d breakIndex %d", session.inBuffer, session.index, session.breakIndex)
@@ -232,6 +234,18 @@ func TestSessionAppendData(t *testing.T) {
 		}
 		if cap(session.inBuffer) < minDataBlock {
 			t.Fatalf("new block capacity %d", cap(session.inBuffer))
+		}
+	}
+	{
+		// With nothing lent, the unread bytes move to the front of the same block, and breakIndex moves with them.
+		block := []byte{1, 2, 3, 4, 5, 6}
+		session := &Session{inBuffer: block[:6:6], index: 4, breakIndex: 6}
+		session.appendData([]byte{7, 8})
+		if !bytes.Equal(session.inBuffer, []byte{5, 6, 7, 8}) || session.index != 0 || session.breakIndex != 2 {
+			t.Fatalf("got %v index %d breakIndex %d", session.inBuffer, session.index, session.breakIndex)
+		}
+		if &session.inBuffer[0] != &block[0] {
+			t.Fatal("a new block was allocated")
 		}
 	}
 	{
@@ -403,4 +417,73 @@ func BenchmarkSessionReadLOB(b *testing.B) {
 			}
 		}
 	})
+}
+
+func TestSessionReuseKeepsLentSlices(t *testing.T) {
+	// A slice GetBytes lent keeps its bytes while later values are read with AppendClr across packets, and after
+	// ResetBuffer, since lending stops inBuffer's memory being reused.
+	long := pattern(100_000)
+	stream := append(append([]byte{}, pattern(16)...), clr(long, 32767, true)...)
+	session := newStreamSession(dataPackets(stream, 1000), 1000)
+	session.UseBigClrChunks = true
+	kept, err := session.GetBytes(16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := session.AppendClr(nil)
+	if err != nil || !bytes.Equal(got, long) {
+		t.Fatalf("value: %v", err)
+	}
+	session.ResetBuffer()
+	if !bytes.Equal(kept, pattern(16)) {
+		t.Fatal("a lent slice changed")
+	}
+}
+
+func TestSessionAppendClrReusesBlocks(t *testing.T) {
+	// Values read with AppendClr lend nothing, so after the first value the session's block is reused: reading another
+	// 1 MiB value across 8 KiB packets doesn't allocate its bytes again.
+	value := pattern(1 << 20)
+	one := clr(value, 32767, true)
+	var stream []byte
+	for i := 0; i < 12; i++ {
+		stream = append(stream, one...)
+	}
+	session := newStreamSession(dataPackets(stream, 8192), len(stream))
+	session.UseBigClrChunks = true
+	dst := make([]byte, 0, len(value))
+	read := func() {
+		var err error
+		if dst, err = session.AppendClr(dst[:0]); err != nil || !bytes.Equal(dst, value) {
+			t.Fatalf("value: %v", err)
+		}
+	}
+	read()
+	read()
+	// Only each packet's small header struct is allocated, not the value's bytes again.
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for i := 0; i < 5; i++ {
+		read()
+	}
+	runtime.ReadMemStats(&after)
+	if perValue := (after.TotalAlloc - before.TotalAlloc) / 5; perValue > uint64(len(value))/64 {
+		t.Fatalf("reading a %d-byte value allocated %d bytes", len(value), perValue)
+	}
+	{
+		// ResetBuffer keeps a block nothing holds a slice of for the next response, and drops one that lent a slice.
+		block := &session.inBuffer[:1][0]
+		session.ResetBuffer()
+		if len(session.inBuffer) != 0 || cap(session.inBuffer) == 0 || &session.inBuffer[:1][0] != block {
+			t.Fatal("the unlent block wasn't kept")
+		}
+		session.inBuffer = append(session.inBuffer, 1, 2, 3)
+		if _, err := session.GetBytes(2); err != nil {
+			t.Fatal(err)
+		}
+		session.ResetBuffer()
+		if session.inBuffer != nil {
+			t.Fatal("a block that lent a slice was kept")
+		}
+	}
 }
