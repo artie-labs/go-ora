@@ -55,6 +55,10 @@ type Session struct {
 	outBuffer      bytes.Buffer
 	index          int
 	breakIndex     int
+	// direct, while directNeed is positive, is where appendBytes wants the next directNeed bytes of data packets to
+	// go instead of inBuffer.
+	direct     *[]byte
+	directNeed int
 	// doneContext       []chan struct{}
 	TimeZone          []byte
 	TTCVersion        uint8
@@ -1123,7 +1127,7 @@ func (session *Session) readPacket() (PacketInterface, error) {
 				session.Disconnect()
 				err = driver.ErrBadConn
 			}
-			session.inBuffer = append(session.inBuffer, dataPck.buffer...)
+			session.takeData(dataPck.buffer)
 		}
 		return nil, err
 	case MARKER:
@@ -1732,6 +1736,66 @@ func (session *Session) GetClr() (output []byte, err error) {
 	// }
 	// output = tempBuffer.Bytes()
 	// return
+}
+
+// takeData appends a data packet's payload to inBuffer, after copying what appendBytes is waiting for to its buffer.
+func (session *Session) takeData(data []byte) {
+	if n := session.directNeed; n > 0 {
+		if n > len(data) {
+			n = len(data)
+		}
+		*session.direct = append(*session.direct, data[:n]...)
+		session.directNeed -= n
+		data = data[n:]
+	}
+	session.inBuffer = append(session.inBuffer, data...)
+}
+
+// AppendClr reads a value as GetClr does and appends it to dst, returning the extended slice, or dst for a NULL. The
+// bytes the input buffer doesn't hold yet go from each data packet straight into dst, so a long value, such as a
+// LOB's data, isn't first appended to the input buffer and then copied out of it.
+func (session *Session) AppendClr(dst []byte) ([]byte, error) {
+	nb, err := session.GetByte()
+	if err != nil || nb == 0 || nb == 0xFF || nb == 0xFD {
+		return dst, err
+	}
+	if nb != 0xFE {
+		return session.appendBytes(dst, int(nb))
+	}
+	for {
+		var size int
+		if session.UseBigClrChunks {
+			size, err = session.GetInt(4, true, true)
+		} else {
+			nb, err = session.GetByte()
+			size = int(nb)
+		}
+		if err != nil || size <= 0 {
+			return dst, err
+		}
+		if dst, err = session.appendBytes(dst, size); err != nil {
+			return dst, err
+		}
+	}
+}
+
+// appendBytes appends the response's next n bytes to dst.
+func (session *Session) appendBytes(dst []byte, n int) ([]byte, error) {
+	buffered := session.inBuffer[session.index:]
+	if len(buffered) >= n {
+		session.index += n
+		return append(dst, buffered[:n]...), nil
+	}
+	dst = append(dst, buffered...)
+	// Start a new input buffer for the bytes after the value, rather than growing this one by every packet's leftover
+	// bytes. Slices of the old one stay as they are.
+	session.inBuffer, session.index, session.breakIndex = nil, 0, 0
+	session.direct, session.directNeed = &dst, n-len(buffered)
+	defer func() { session.direct, session.directNeed = nil, 0 }()
+	// read reads packets until the input buffer holds a byte past these n, which a LOB read's response always has, and
+	// takeData appends the n bytes to dst on the way.
+	_, err := session.Peek(1)
+	return dst, err
 }
 
 // GetDlc read variable length bytearray from input buffer
